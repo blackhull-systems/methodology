@@ -1,0 +1,21 @@
+# Secret scanning for Blackhull's public repos: gitleaks' default rules, plus the one secret they miss that matters
+# most here. MEASURED 2026-11-03: the defaults did not flag an Ethereum private key planted in a .mjs file.
+title = "blackhull public repos"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "evm-private-key"
+description = "Any 64 hex digits (with or without 0x) are treated as a private key, unless it is a transaction link we publish on purpose"
+regex = '''\b(?:0x)?[0-9a-fA-F]{64}\b'''
+
+[[rules.allowlists]]
+description = "transaction hashes in basescan links (VERIFICATION.md), and download checksums a workflow verifies"
+regexTarget = "line"
+regexes = ['''basescan\.org/tx/0x[0-9a-fA-F]{64}''', '''^\s*echo "[0-9a-f]{64}  [\w.-]+" \| sha256sum -c$''']
+
+[[allowlists]]
+description = "public Base contract addresses used as example inputs (USDC, WETH): not secrets"
+regexTarget = "secret"
+regexes = ['''(?i)^0x(833589fcd6edb6e08f4c7c32d4f71b54bda02913|4200000000000000000000000000000000000006)$''']
