@@ -87,12 +87,38 @@ watched long enough (see thresholds); before that the grade is `INSUFFICIENT_DAT
 | `LIQUIDITY` | positive | a pool holds at least 0.1 WETH/ETH or 250 USDC against this token |
 | `THIN_LIQUIDITY` | caution | pools exist, but none holds 0.1 WETH/ETH or 250 USDC |
 | `NO_POOL_FOUND` | caution | no pool was found (on Uniswap v4: among the pool configurations most used on Base) |
+| `SELL_OK` | positive | a simulated buy and an immediate sale of everything bought both went through |
+| `SELL_BLOCKED` | caution | a simulated buy went through, and the immediate sale of what it bought reverted |
+| `HIGH_TAX` | caution | the simulated buy or sale lost 10% or more of the tokens moved to the token itself (a transfer tax) |
+| `BUY_FAILED` | info | the simulated buy reverted (trading not open, or a pool hook that refuses it), so selling was not tested |
 
 **How powers are found:** the deployed bytecode is scanned for the 4-byte function selectors of known admin
 functions (for example `mint(address,uint256)`). If the contract is a proxy, its implementation is found by reading
 each 32-byte storage slot the proxy's own code names (`PUSH32` constants, covering EIP-1967 and older layouts) and the
 implementation's code is scanned too. A selector's presence means the code *can* call that function; it does not mean
 anyone will.
+
+**How a sale is simulated (`SELL_OK`, `SELL_BLOCKED`, `HIGH_TAX`, `BUY_FAILED`):** on the deepest pool that holds
+liquidity, a small buy (0.001 ETH or 1 USDC, and never more than 0.1% of the pool's quote reserve) is followed at once by
+a sale of everything it bought, in one `eth_call`. The contract that trades,
+[`sell-simulation/SellCheck.sol`](sell-simulation/SellCheck.sol), is never deployed: the call places its code at an
+unused address with a state override and gives it the ETH (or USDC) to spend, so nothing is sent, signed or paid and
+the chain is unchanged. It trades with the pool itself (Uniswap v2, v3 and v4 including the pool's hook, Aerodrome and
+Slipstream), and it sells the way a router does: the tokens are approved to a second address that pulls them with
+`transferFrom`, because a token can let a holder send tokens while refusing every router, and a sale tested with a plain
+transfer would then read as possible when no real sale is.
+
+- A **tax** is measured from balances, not read from the token: the buy tax is the share of what the pool released that
+  did not arrive; the sell tax, the share of what was sent that the pool did not receive. `HIGH_TAX` is 10% or more
+  on either leg. A fee that a pool or its hook keeps is not a token tax; it shows in `round_trip_back_pct`, the share of
+  the spend the sale returned (pool fees and price movement included).
+- **What it does not show:** the result is for this pool, this block and this size, by a contract holder. A token can
+  change its rules later, treat other holders or larger sales differently, or limit sales over time; one simulation
+  sees none of that.
+
+Compiled with solc 0.8.28 (optimizer 200 runs, via-IR, EVM version cancun). Every answer's evidence names the
+keccak-256 of the bytecode the simulation ran (`simulator_keccak256`), and that bytecode ends in the metadata hash of
+exactly this source, so anyone can compile it and compare.
 
 ## Organic and funded demand
 
