@@ -112,6 +112,12 @@ transfer would then read as possible when no real sale is.
   did not arrive; the sell tax, the share of what was sent that the pool did not receive. `HIGH_TAX` is 10% or more
   on either leg. A fee that a pool or its hook keeps is not a token tax; it shows in `round_trip_back_pct`, the share of
   the spend the sale returned (pool fees and price movement included).
+- **A token cannot tell it is being tested.** Each check trades from a fresh random address, with random bytes after the
+  simulator's code (so it has no code hash to look for), at the network's current gas price, with a buy size that varies.
+  A token that let only the simulator sell would otherwise read as sellable while trapping real buyers.
+- **Text the token wrote is labelled as such.** A token's name and symbol, and the reason its code gives when a trade
+  reverts, are written by its deployer. They are cleaned of hidden characters, shortened, and listed in every answer's
+  `untrusted_text`: data to show, never instructions. Blackhull's findings are the codes.
 - **What it does not show:** the result is for this pool, this block and this size, by a contract holder. A token can
   change its rules later, treat other holders or larger sales differently, or limit sales over time; one simulation
   sees none of that.

@@ -9,7 +9,9 @@ pragma solidity 0.8.28;
 ///      reason instead of discarding the buy. Taxes are measured from balance movements, not from what the
 ///      token claims about itself: a token can lie in a view function, it cannot lie in a transfer.
 ///      The SALE moves the token the way a router does: approve a spender, and the spender pulls it with
-///      transferFrom. A copy of this code at SPENDER is that spender (the token check overrides both addresses).
+///      transferFrom. A copy of this code at the spender — this contract's own address with its lowest bit flipped — is
+///      that spender. The token check places both copies at a fresh random address pair on every check, each copy
+///      followed by random bytes, so a token cannot recognize the simulator by its address or by its code hash.
 ///      A token that lets a holder push tokens with transfer() but refuses a router's transferFrom() traps
 ///      every real seller, so a sale simulated with transfer() would wrongly read as sellable.
 interface IERC20 {
@@ -67,7 +69,6 @@ contract SellCheck {
 
     address internal constant WETH = 0x4200000000000000000000000000000000000006;
     address internal constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
-    address internal constant SPENDER = 0x00000000000000000000000000000000B1aC5e12;
     uint160 internal constant MIN_SQRT = 4295128740;
     uint160 internal constant MAX_SQRT = 1461446703485210103287273052203988822378723970341;
 
@@ -232,13 +233,14 @@ contract SellCheck {
         _call(token, abi.encodeWithSignature("transfer(address,uint256)", to, amount), "transfer failed");
     }
 
-    /// @dev As a router sells: approve SPENDER for exactly `amount`, and SPENDER pulls it with transferFrom.
+    /// @dev As a router sells: approve the spender for exactly `amount`, and the spender pulls it with transferFrom.
     function _pull(address token, address to, uint256 amount) internal {
-        _call(token, abi.encodeWithSignature("approve(address,uint256)", SPENDER, amount), "approve failed");
-        SellCheck(payable(SPENDER)).pullFrom(token, address(this), to, amount);
+        address spender = address(uint160(address(this)) ^ 1);
+        _call(token, abi.encodeWithSignature("approve(address,uint256)", spender, amount), "approve failed");
+        SellCheck(payable(spender)).pullFrom(token, address(this), to, amount);
     }
 
-    /// @notice SPENDER's half of a sale: move `amount` of `token` from `from` to `to` under the allowance it was given.
+    /// @notice The spender's half of a sale: move `amount` of `token` from `from` to `to` under the allowance it was given.
     function pullFrom(address token, address from, address to, uint256 amount) external {
         _call(token, abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount), "transferFrom failed");
     }
