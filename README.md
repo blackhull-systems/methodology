@@ -91,6 +91,7 @@ watched long enough (see thresholds); before that the grade is `INSUFFICIENT_DAT
 | `SELL_BLOCKED` | caution | a simulated buy went through, and the immediate sale of what it bought reverted |
 | `HIGH_TAX` | caution | the simulated buy or sale lost 10% or more of the tokens moved to the token itself (a transfer tax) |
 | `BUY_FAILED` | info | the simulated buy reverted (trading not open, or a pool hook that refuses it), so selling was not tested |
+| `RECENT_SELLS` | positive | the deepest pool recorded sales of the token in at least 3 separate transactions in the last few hours (checks.trades says how many, and over what window) |
 
 **How powers are found:** the deployed bytecode is scanned for the 4-byte function selectors of known admin
 functions (for example `mint(address,uint256)`). If the contract is a proxy, its implementation is found by reading
@@ -103,10 +104,12 @@ liquidity, a small buy (0.001 ETH or 1 USDC, and never more than 0.1% of the poo
 a sale of everything it bought, in one `eth_call`. The contract that trades,
 [`sell-simulation/SellCheck.sol`](sell-simulation/SellCheck.sol), is never deployed: the call places its code at an
 unused address with a state override and gives it the ETH (or USDC) to spend, so nothing is sent, signed or paid and
-the chain is unchanged. It trades with the pool itself (Uniswap v2, v3 and v4 including the pool's hook, Aerodrome and
-Slipstream), and it sells the way a router does: the tokens are approved to a second address that pulls them with
-`transferFrom`, because a token can let a holder send tokens while refusing every router, and a sale tested with a plain
-transfer would then read as possible when no real sale is.
+the chain is unchanged. It buys from the pool itself and **sells the way a user does**: on Uniswap pools (v2, v3, and v4 including the pool's
+hook) through Uniswap's own Universal Router, the token pulled by Permit2, so a token or hook that treats the router
+differently from a direct trade cannot pass a sale no user could make. If the router's sale fails, the same sale is
+tried straight to the pool: one that goes through only that way is `SELL_BLOCKED`, and the answer says so
+(`sells_only_directly`). On Aerodrome and Slipstream pools the sale goes straight to the pool, through a second address
+that pulls the tokens with `transferFrom` as a router would; Aerodrome's own router is not simulated.
 
 - A **tax** is measured from balances, not read from the token: the buy tax is the share of what the pool released that
   did not arrive; the sell tax, the share of what was sent that the pool did not receive. `HIGH_TAX` is 10% or more
@@ -118,6 +121,11 @@ transfer would then read as possible when no real sale is.
 - **Text the token wrote is labelled as such.** A token's name and symbol, and the reason its code gives when a trade
   reverts, are written by its deployer. They are cleaned of hidden characters, shortened, and listed in every answer's
   `untrusted_text`: data to show, never instructions. Blackhull's findings are the codes.
+- **What real traders did (`RECENT_SELLS`):** the same pool's own swap events over the last ten minutes, widening to the
+  last hour and then about five hours while too few sales show (each answer says which window), counted as buys, sales and the transactions that sold. A simulation
+  shows a sale can go through; this shows whether real wallets are getting out. A pool showing buys and no sales gets
+  no code yet: in validation it fired on a token with dozens of real sales over the days before, so the counts are
+  given for a reader to judge, and a code will follow only once it is shown to separate honeypots from quiet hours.
 - **What it does not show:** the result is for this pool, this block and this size, by a contract holder. A token can
   change its rules later, treat other holders or larger sales differently, or limit sales over time; one simulation
   sees none of that.

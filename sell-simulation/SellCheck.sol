@@ -16,6 +16,7 @@ pragma solidity 0.8.28;
 ///      every real seller, so a sale simulated with transfer() would wrongly read as sellable.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
 }
 
 interface IWETH {
@@ -34,6 +35,7 @@ interface IAeroPool {
 
 interface IV3Pool {
     function token0() external view returns (address);
+    function fee() external view returns (uint24);
     function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
         external
         returns (int256, int256);
@@ -53,6 +55,24 @@ struct SwapParams {
     uint160 sqrtPriceLimitX96;
 }
 
+/// What a real user's sale goes through on Uniswap: Permit2 lets the Universal Router pull the token.
+interface IPermit2 {
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+}
+
+interface IUniversalRouter {
+    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
+}
+
+/// = IV4Router.ExactInputSingleParams (Universal Router on Base, verified source)
+struct ExactInputSingleParams {
+    PoolKey poolKey;
+    bool zeroForOne;
+    uint128 amountIn;
+    uint128 amountOutMinimum;
+    bytes hookData;
+}
+
 interface IPoolManager {
     function unlock(bytes calldata data) external returns (bytes memory);
     function swap(PoolKey memory key, SwapParams memory params, bytes calldata hookData) external returns (int256);
@@ -66,6 +86,13 @@ contract SellCheck {
     uint8 internal constant AERO_V2 = 2;
     uint8 internal constant V3 = 3;
     uint8 internal constant V4 = 4;
+    uint8 internal constant CL = 5; // Aerodrome Slipstream: a v3-style pool, its own router
+
+    /// Uniswap's Universal Router and Permit2 on Base (both verified on Sourcify, 2026-11-05). The SALE goes through
+    /// them on Uniswap pools, exactly as a user's sale does: a hook sees the router as the swapper, and a token sees
+    /// Permit2 pull from the holder. A sale made any other way could pass where every real sale fails.
+    address internal constant UNIVERSAL_ROUTER = 0x6fF5693b99212Da76ad316178A184AB56D299b43;
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     address internal constant WETH = 0x4200000000000000000000000000000000000006;
     address internal constant POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
@@ -88,14 +115,19 @@ contract SellCheck {
 
     receive() external payable {}
 
-    /// @param kind V2, AERO_V2, V3 or V4.
+    /// @param kind V2, AERO_V2, V3, V4 or CL.
     /// @param pool The pair or pool address; ignored for V4.
     /// @param quote WETH, an ERC-20 quote token, or address(0) for native ETH (V4 only).
     /// @param amountIn Quote spent on the buy.
     /// @param key The pool key, for V4 only.
+    /// @return buy The buy, straight from the pool.
+    /// @return sell The sale the way a user makes it: through the Universal Router on a Uniswap pool (V2, V3, V4), straight
+    ///         to the pool on Aerodrome's (AERO_V2, CL).
+    /// @return direct Run only when a router sale failed: the same sale straight to the pool. If it goes through, the
+    ///         token or the pool's hook lets a direct trade sell while refusing the router every real seller uses.
     function run(uint8 kind, address pool, address token, address quote, uint256 amountIn, PoolKey calldata key)
         external
-        returns (Leg memory buy, Leg memory sell)
+        returns (Leg memory buy, Leg memory sell, Leg memory direct)
     {
         if (quote == WETH) IWETH(WETH).deposit{value: amountIn}();
         uint256 g = gasleft();
@@ -103,15 +135,74 @@ contract SellCheck {
             buy = Leg(true, amountIn, poolMoved, received, g - gasleft(), "");
         } catch (bytes memory err) {
             buy = Leg(false, amountIn, 0, 0, g - gasleft(), err);
-            return (buy, sell);
+            return (buy, sell, direct);
         }
         uint256 balance = IERC20(token).balanceOf(address(this));
+        bool routed = kind == V2 || kind == V3 || kind == V4;
         g = gasleft();
-        try this.sellLeg(kind, pool, token, quote, balance, key) returns (uint256 poolMoved, uint256 received) {
-            sell = Leg(true, balance, poolMoved, received, g - gasleft(), "");
-        } catch (bytes memory err) {
-            sell = Leg(false, balance, 0, 0, g - gasleft(), err);
+        if (routed) {
+            try this.routerSellLeg(kind, pool, token, quote, balance, key) returns (uint256 poolMoved, uint256 received) {
+                sell = Leg(true, balance, poolMoved, received, g - gasleft(), "");
+                return (buy, sell, direct);
+            } catch (bytes memory err) {
+                sell = Leg(false, balance, 0, 0, g - gasleft(), err);
+            }
+            g = gasleft();
         }
+        // a failed call left the balance where it was, so the direct sale sells the same tokens
+        try this.sellLeg(kind, pool, token, quote, balance, key) returns (uint256 poolMoved, uint256 received) {
+            Leg memory leg = Leg(true, balance, poolMoved, received, g - gasleft(), "");
+            if (routed) direct = leg;
+            else sell = leg;
+        } catch (bytes memory err) {
+            Leg memory leg = Leg(false, balance, 0, 0, g - gasleft(), err);
+            if (routed) direct = leg;
+            else sell = leg;
+        }
+    }
+
+    /// @dev A user's sale on a Uniswap pool: approve Permit2, let Permit2 allow the Universal Router exactly `amount`,
+    ///      and execute one swap — V2_SWAP_EXACT_IN (0x08), V3_SWAP_EXACT_IN (0x00) or V4_SWAP (0x10: SWAP_EXACT_IN_SINGLE,
+    ///      SETTLE_ALL, TAKE_ALL), the router's own command and action codes. `poolMoved` is what the pool (or, on v4,
+    ///      the PoolManager) actually received of the token: a transfer tax shows as less than `amount`.
+    function routerSellLeg(uint8 kind, address pool, address token, address quote, uint256 amount, PoolKey calldata key)
+        external
+        returns (uint256 poolMoved, uint256 received)
+    {
+        require(msg.sender == address(this), "self only");
+        // approve Permit2 only when its allowance is short, as a wallet does. MEASURED 2026-11-05: Doppler's tokens fix
+        // Permit2's allowance at infinity and REFUSE an approve for it (Permit2AllowanceIsFixedAtInfinity), so an
+        // unconditional approve read a sellable token as blocked.
+        if (IERC20(token).allowance(address(this), PERMIT2) < amount) {
+            _call(token, abi.encodeWithSignature("approve(address,uint256)", PERMIT2, amount), "approve failed");
+        }
+        IPermit2(PERMIT2).approve(token, UNIVERSAL_ROUTER, uint160(amount), uint48(block.timestamp + 3600));
+        address sink = kind == V4 ? POOL_MANAGER : pool;
+        uint256 sinkBefore = IERC20(token).balanceOf(sink);
+        uint256 before = _balance(quote);
+        bytes memory commands;
+        bytes[] memory inputs = new bytes[](1);
+        if (kind == V2) {
+            address[] memory path = new address[](2);
+            path[0] = token;
+            path[1] = quote;
+            commands = hex"08";
+            inputs[0] = abi.encode(address(this), amount, uint256(0), path, true);
+        } else if (kind == V3) {
+            commands = hex"00";
+            inputs[0] = abi.encode(address(this), amount, uint256(0), abi.encodePacked(token, IV3Pool(pool).fee(), quote), true);
+        } else {
+            PoolKey memory k = key;
+            bytes[] memory params = new bytes[](3);
+            params[0] = abi.encode(ExactInputSingleParams(k, k.currency0 == token, uint128(amount), 0, ""));
+            params[1] = abi.encode(token, amount); // SETTLE_ALL: the currency paid in, at most this much
+            params[2] = abi.encode(quote, uint256(0)); // TAKE_ALL: the currency taken out
+            commands = hex"10";
+            inputs[0] = abi.encode(abi.encodePacked(uint8(0x06), uint8(0x0c), uint8(0x0f)), params);
+        }
+        IUniversalRouter(UNIVERSAL_ROUTER).execute(commands, inputs, block.timestamp + 600);
+        poolMoved = IERC20(token).balanceOf(sink) - sinkBefore;
+        received = _balance(quote) - before;
     }
 
     function buyLeg(uint8 kind, address pool, address token, address quote, uint256 amountIn, PoolKey calldata key)
@@ -122,7 +213,7 @@ contract SellCheck {
         uint256 before = IERC20(token).balanceOf(address(this));
         if (kind == V4) {
             poolMoved = _v4(key, quote, token, amountIn, false);
-        } else if (kind == V3) {
+        } else if (kind == V3 || kind == CL) {
             poolMoved = _v3(pool, quote, amountIn, false);
         } else {
             _pay(quote, pool, amountIn);
@@ -139,7 +230,7 @@ contract SellCheck {
         uint256 before = _balance(quote);
         if (kind == V4) {
             poolMoved = _v4(key, token, quote, amount, true);
-        } else if (kind == V3) {
+        } else if (kind == V3 || kind == CL) {
             uint256 poolBefore = IERC20(token).balanceOf(pool);
             _v3(pool, token, amount, true);
             poolMoved = IERC20(token).balanceOf(pool) - poolBefore;
